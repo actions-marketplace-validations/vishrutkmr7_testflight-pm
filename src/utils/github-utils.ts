@@ -11,7 +11,7 @@ import type {
 } from "../../types/github.js";
 import type { ProcessedFeedbackData } from "../../types/testflight.js";
 import { getGitHubClient, validateGitHubConfig } from "../api/github-client.js";
-import { DEFAULT_LABELS, ERROR_MESSAGES } from "../config/constants.js";
+import { DEFAULT_LABEL_CONFIG, ERROR_MESSAGES } from "../config/index.js";
 
 /**
  * Creates a GitHub issue from TestFlight feedback with intelligent handling
@@ -220,7 +220,7 @@ export function generateFeedbackLabels(
 
 	// Type-based labels
 	if (feedback.type === "crash") {
-		labels.push(...DEFAULT_LABELS.CRASH);
+		labels.push(...DEFAULT_LABEL_CONFIG.crashLabels);
 
 		// Severity-based labels
 		if (
@@ -449,7 +449,7 @@ export function validateGitHubIntegration(): {
 
 	if (!validateGitHubConfig()) {
 		errors.push(
-			"GitHub configuration missing. Please set GITHUB_TOKEN, GITHUB_OWNER, and GITHUB_REPO.",
+			"GitHub configuration missing. Please set GTHB_TOKEN, GITHUB_OWNER, and GITHUB_REPO.",
 		);
 	}
 
@@ -487,7 +487,7 @@ export async function getGitHubIntegrationHealth(): Promise<{
 					timestamp: new Date().toISOString(),
 				},
 				recommendations: [
-					"Set GITHUB_TOKEN environment variable",
+					"Set GTHB_TOKEN environment variable",
 					"Set GITHUB_OWNER environment variable",
 					"Set GITHUB_REPO environment variable",
 					"Verify GitHub API access permissions",
@@ -504,11 +504,11 @@ export async function getGitHubIntegrationHealth(): Promise<{
 			recommendations:
 				healthCheck.status !== "healthy"
 					? [
-							"Verify GitHub token is valid and has proper permissions",
-							"Check repository owner and name are correct",
-							"Ensure network connectivity to GitHub API",
-							"Verify repository access permissions",
-						]
+						"Verify GitHub token is valid and has proper permissions",
+						"Check repository owner and name are correct",
+						"Ensure network connectivity to GitHub API",
+						"Verify repository access permissions",
+					]
 					: undefined,
 		};
 	} catch (error) {

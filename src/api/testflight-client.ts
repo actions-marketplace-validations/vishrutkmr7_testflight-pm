@@ -4,8 +4,19 @@
  */
 
 import type {
+	AppBetaFeedbackCrashSubmissionsResponse,
+	AppBetaFeedbackScreenshotSubmissionsResponse,
+	CrashLogRelationshipsResponse,
+	CrashLogResponse,
+	DetailedCrashSubmissionResponse,
+	DetailedScreenshotSubmissionResponse,
+	DetailedTestFlightCrashReport,
+	DetailedTestFlightScreenshotFeedback,
+	EnhancedScreenshotImage,
 	ProcessedFeedbackData,
-	TestFlightApiResponse,
+	TestFlightApp,
+	TestFlightAppsResponse,
+	TestFlightCrashLog,
 	TestFlightCrashReport,
 	TestFlightErrorResponse,
 	TestFlightQueryParams,
@@ -13,9 +24,9 @@ import type {
 } from "../../types/testflight.js";
 import {
 	API_ENDPOINTS,
-	HTTP_CONFIG,
-	TESTFLIGHT_CONFIG,
-} from "../config/constants.js";
+	DEFAULT_HTTP_CONFIG,
+	DEFAULT_TESTFLIGHT_CONFIG,
+} from "../config/index.js";
 import { getAuthInstance } from "./app-store-connect-auth.js";
 
 export interface RateLimitInfo {
@@ -35,101 +46,129 @@ export interface ApiRequestOptions {
  */
 export class TestFlightClient {
 	private readonly baseUrl = API_ENDPOINTS.APP_STORE_CONNECT;
-	private readonly defaultTimeout = HTTP_CONFIG.DEFAULT_TIMEOUT;
-	private readonly defaultRetries = HTTP_CONFIG.DEFAULT_RETRIES;
-	private readonly defaultRetryDelay = HTTP_CONFIG.DEFAULT_RETRY_DELAY;
+	private readonly defaultTimeout = DEFAULT_HTTP_CONFIG.timeout;
+	private readonly defaultRetries = DEFAULT_HTTP_CONFIG.retries;
+	private readonly defaultRetryDelay = DEFAULT_HTTP_CONFIG.retryDelay;
+	private readonly appId: string | null;
 
 	private rateLimitInfo: RateLimitInfo | null = null;
 
-	/**
-	 * Fetches crash reports for the configured app
-	 */
-	public async getCrashReports(
-		params?: TestFlightQueryParams,
-	): Promise<TestFlightCrashReport[]> {
-		const queryParams = {
-			limit: TESTFLIGHT_CONFIG.DEFAULT_LIMIT,
-			sort: TESTFLIGHT_CONFIG.DEFAULT_SORT,
-			...params,
-		};
+	constructor() {
+		// Get app ID from configuration if available
+		const { getConfiguration } = require("../config/index.js");
+		const config = getConfiguration();
+		this.appId = config.appStoreConnect.appId || null;
 
-		const response = await this.makeApiRequest<
-			TestFlightApiResponse<TestFlightCrashReport>
-		>("/betaFeedbackCrashSubmissions", queryParams);
-
-		return response.data;
+		// Note: appId is no longer required in constructor since we can resolve from bundle ID
 	}
 
 	/**
-	 * Fetches screenshot feedback for the configured app
+	 * Fetches screenshot feedback for a specific app (legacy method - use getEnhancedRecentFeedback instead)
+	 * @deprecated Use getAppScreenshotFeedback or getEnhancedRecentFeedback instead
 	 */
 	public async getScreenshotFeedback(
 		params?: TestFlightQueryParams,
 	): Promise<TestFlightScreenshotFeedback[]> {
+		if (!this.appId) {
+			throw new Error("App ID is required. Use getAppScreenshotFeedback with explicit app ID instead.");
+		}
+		return this.getAppScreenshotFeedback(this.appId, params);
+	}
+
+	/**
+	 * Gets screenshot submissions for a specific app using Apple's app-specific endpoint
+	 * Uses /apps/{id}/betaFeedbackScreenshotSubmissions
+	 */
+	public async getAppScreenshotSubmissions(
+		appId: string,
+		params?: TestFlightQueryParams,
+	): Promise<TestFlightScreenshotFeedback[]> {
 		const queryParams = {
-			limit: TESTFLIGHT_CONFIG.DEFAULT_LIMIT,
-			sort: TESTFLIGHT_CONFIG.DEFAULT_SORT,
+			limit: DEFAULT_TESTFLIGHT_CONFIG.DEFAULT_LIMIT,
+			sort: DEFAULT_TESTFLIGHT_CONFIG.DEFAULT_SORT,
 			...params,
 		};
 
-		const response = await this.makeApiRequest<
-			TestFlightApiResponse<TestFlightScreenshotFeedback>
-		>("/betaFeedbackScreenshotSubmissions", queryParams);
+		const response = await this.makeApiRequest<AppBetaFeedbackScreenshotSubmissionsResponse>(
+			`/apps/${appId}/betaFeedbackScreenshotSubmissions`,
+			queryParams,
+		);
 
 		return response.data;
 	}
 
 	/**
-	 * Fetches all feedback (crashes and screenshots) and returns processed data
+	 * Gets screenshot submissions for a specific app with date filtering
+	 * Handles the API's 'createdDate' field requirements and provides fallback filtering
 	 */
-	public async getAllFeedback(
-		params?: TestFlightQueryParams,
-	): Promise<ProcessedFeedbackData[]> {
+	private async getAppScreenshotSubmissionsWithDateFilter(
+		appId: string,
+		since: Date,
+	): Promise<TestFlightScreenshotFeedback[]> {
 		try {
-			const [crashes, screenshots] = await Promise.all([
-				this.getCrashReports(params),
-				this.getScreenshotFeedback(params),
-			]);
+			// First try with API-level date filtering using createdDate
+			const isoDate = since.toISOString();
+			const apiFilteredResults = await this.getAppScreenshotSubmissions(appId, {
+				filter: {
+					createdDate: `>${isoDate}`,
+				},
+				limit: 100,
+			});
 
-			const processedData: ProcessedFeedbackData[] = [];
-
-			// Process crash reports
-			for (const crash of crashes) {
-				processedData.push(this.processCrashReport(crash));
-			}
-
-			// Process screenshot feedback
-			for (const screenshot of screenshots) {
-				processedData.push(this.processScreenshotFeedback(screenshot));
-			}
-
-			// Sort by submission date (newest first)
-			processedData.sort(
-				(a, b) => b.submittedAt.getTime() - a.submittedAt.getTime(),
-			);
-
-			return processedData;
+			console.log(`✅ API-level date filtering successful for screenshot submissions`);
+			return apiFilteredResults;
 		} catch (error) {
-			throw new Error(`Failed to fetch all feedback: ${error}`);
+			// If API filtering fails, fall back to fetching more data and filtering client-side
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			console.warn(`⚠️ API-level date filtering failed for screenshot submissions: ${errorMessage}`);
+			console.log(`🔄 Falling back to client-side filtering...`);
+
+			try {
+				// Fetch broader dataset (last 7 days worth to be safe)
+				const allRecentScreenshots = await this.getAppScreenshotSubmissions(appId, {
+					limit: DEFAULT_TESTFLIGHT_CONFIG.MAX_LIMIT, // Get more results
+				});
+
+				// Filter client-side based on actual createdDate or submittedAt fields
+				const filteredScreenshots = allRecentScreenshots.filter(screenshot => {
+					const createdDate = new Date(screenshot.attributes.createdDate || screenshot.attributes.submittedAt || 0);
+					return createdDate >= since;
+				});
+
+				console.log(`✅ Client-side filtering successful: ${filteredScreenshots.length}/${allRecentScreenshots.length} screenshot submissions match date filter`);
+				return filteredScreenshots;
+			} catch (fallbackError) {
+				console.error(`❌ Both API and client-side filtering failed for screenshot submissions:`, fallbackError);
+				throw fallbackError;
+			}
 		}
 	}
 
 	/**
-	 * Fetches recent feedback since a specific date
+	 * Gets detailed information about a specific screenshot submission
+	 * Uses /betaFeedbackScreenshotSubmissions/{id}
 	 */
-	public async getRecentFeedback(
-		since: Date,
-	): Promise<ProcessedFeedbackData[]> {
-		const isoDate = since.toISOString();
+	public async getDetailedScreenshotSubmission(
+		screenshotId: string,
+		params?: TestFlightQueryParams,
+	): Promise<DetailedTestFlightScreenshotFeedback> {
+		const response = await this.makeApiRequest<DetailedScreenshotSubmissionResponse>(
+			`/betaFeedbackScreenshotSubmissions/${screenshotId}`,
+			params,
+		);
 
-		const params: TestFlightQueryParams = {
-			filter: {
-				submittedAt: `>${isoDate}`,
-			},
-			limit: 100,
-		};
+		return response.data;
+	}
 
-		return await this.getAllFeedback(params);
+	/**
+	 * Gets screenshot feedback for a specific app (legacy method - use getAppScreenshotSubmissions instead)
+	 * @deprecated Use getAppScreenshotSubmissions for better performance and proper API endpoint
+	 */
+	public async getAppScreenshotFeedback(
+		appId: string,
+		params?: TestFlightQueryParams,
+	): Promise<TestFlightScreenshotFeedback[]> {
+		return this.getAppScreenshotSubmissions(appId, params);
 	}
 
 	/**
@@ -140,7 +179,13 @@ export class TestFlightClient {
 	): Promise<string[]> {
 		const logs: string[] = [];
 
-		for (const logInfo of crashReport.attributes.crashLogs) {
+		// Check if crashLogs exists before iterating
+		const { crashLogs } = crashReport.attributes;
+		if (!crashLogs || crashLogs.length === 0) {
+			return logs;
+		}
+
+		for (const logInfo of crashLogs) {
 			try {
 				// Check if URL hasn't expired
 				const expiresAt = new Date(logInfo.expiresAt);
@@ -174,38 +219,68 @@ export class TestFlightClient {
 	}
 
 	/**
-	 * Downloads screenshots from the provided URLs
+	 * Downloads screenshots from the provided URLs with enhanced error handling
+	 * @deprecated Use downloadEnhancedScreenshots for better performance and metadata
 	 */
 	public async downloadScreenshots(
 		screenshotFeedback: TestFlightScreenshotFeedback,
 	): Promise<Uint8Array[]> {
+		const { screenshots } = screenshotFeedback.attributes;
+		return await this.downloadScreenshotImages(screenshots);
+	}
+
+	/**
+	 * Downloads enhanced screenshots with metadata and validation
+	 */
+	public async downloadEnhancedScreenshots(
+		screenshotFeedback: DetailedTestFlightScreenshotFeedback,
+	): Promise<{ data: Uint8Array; metadata: EnhancedScreenshotImage }[]> {
+		const results: { data: Uint8Array; metadata: EnhancedScreenshotImage }[] = [];
+
+		const enhancedImages = await this.processEnhancedScreenshotImages(
+			screenshotFeedback.attributes.screenshots
+		);
+
+		for (const imageMetadata of enhancedImages) {
+			try {
+				const imageData = await this.downloadSingleScreenshotImage(imageMetadata);
+				if (imageData) {
+					results.push({
+						data: imageData,
+						metadata: imageMetadata,
+					});
+				}
+			} catch (error) {
+				console.warn(
+					`Error downloading enhanced screenshot ${imageMetadata.fileName}:`,
+					error,
+				);
+			}
+		}
+
+		return results;
+	}
+
+	/**
+	 * Downloads screenshot images from URL array (DRY helper method)
+	 */
+	private async downloadScreenshotImages(
+		screenshots: TestFlightScreenshotFeedback["attributes"]["screenshots"],
+	): Promise<Uint8Array[]> {
 		const images: Uint8Array[] = [];
 
-		for (const imageInfo of screenshotFeedback.attributes.screenshots) {
+		for (const imageInfo of screenshots) {
 			try {
-				// Check if URL hasn't expired
-				const expiresAt = new Date(imageInfo.expiresAt);
-				if (expiresAt <= new Date()) {
-					console.warn(`Screenshot URL expired: ${imageInfo.url}`);
-					continue;
-				}
-
-				const response = await fetch(imageInfo.url, {
-					headers: {
-						"User-Agent": "TestFlight-PM/1.0",
-					},
-					signal: AbortSignal.timeout(this.defaultTimeout),
+				const imageData = await this.downloadSingleScreenshotImage({
+					url: imageInfo.url,
+					fileName: imageInfo.fileName,
+					fileSize: imageInfo.fileSize,
+					expiresAt: new Date(imageInfo.expiresAt),
 				});
 
-				if (!response.ok) {
-					console.warn(
-						`Failed to download screenshot: ${response.status} ${response.statusText}`,
-					);
-					continue;
+				if (imageData) {
+					images.push(imageData);
 				}
-
-				const imageData = new Uint8Array(await response.arrayBuffer());
-				images.push(imageData);
 			} catch (error) {
 				console.warn(
 					`Error downloading screenshot from ${imageInfo.url}:`,
@@ -218,6 +293,44 @@ export class TestFlightClient {
 	}
 
 	/**
+	 * Downloads a single screenshot image with validation (Single Responsibility)
+	 */
+	private async downloadSingleScreenshotImage(
+		imageInfo: { url: string; fileName: string; fileSize: number; expiresAt: Date },
+	): Promise<Uint8Array | null> {
+		// Check if URL hasn't expired
+		if (imageInfo.expiresAt <= new Date()) {
+			console.warn(`Screenshot URL expired: ${imageInfo.url}`);
+			return null;
+		}
+
+		const response = await fetch(imageInfo.url, {
+			headers: {
+				"User-Agent": "TestFlight-PM/1.0",
+			},
+			signal: AbortSignal.timeout(this.defaultTimeout),
+		});
+
+		if (!response.ok) {
+			console.warn(
+				`Failed to download screenshot: ${response.status} ${response.statusText}`,
+			);
+			return null;
+		}
+
+		const imageData = new Uint8Array(await response.arrayBuffer());
+
+		// Validate file size if specified
+		if (imageInfo.fileSize > 0 && imageData.length !== imageInfo.fileSize) {
+			console.warn(
+				`Screenshot size mismatch for ${imageInfo.fileName}: expected ${imageInfo.fileSize}, got ${imageData.length}`,
+			);
+		}
+
+		return imageData;
+	}
+
+	/**
 	 * Gets current rate limit information
 	 */
 	public getRateLimitInfo(): RateLimitInfo | null {
@@ -225,7 +338,413 @@ export class TestFlightClient {
 	}
 
 	/**
-	 * Makes an authenticated API request with retry logic and rate limiting
+	 * Gets the configured app ID for health checking
+	 */
+	public getConfiguredAppId(): string | null {
+		return this.appId || null;
+	}
+
+	/**
+	 * Tests authentication without making a full API request
+	 * Used by health checkers to verify credentials
+	 */
+	public async testAuthentication(): Promise<boolean> {
+		try {
+			const authInstance = getAuthInstance();
+			await authInstance.getValidToken();
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Lists all apps in the App Store Connect account
+	 */
+	public async getApps(params?: TestFlightQueryParams): Promise<TestFlightApp[]> {
+		const queryParams = {
+			limit: DEFAULT_TESTFLIGHT_CONFIG.DEFAULT_LIMIT,
+			...params,
+		};
+
+		const response = await this.makeApiRequest<TestFlightAppsResponse>(
+			"/apps",
+			queryParams,
+		);
+
+		return response.data;
+	}
+
+	/**
+	 * Finds an app by its bundle ID using reliable unfiltered search + manual matching
+	 * Note: Bundle ID filtering via API query parameters appears to be unreliable,
+	 * so we fetch all apps and filter manually for better reliability
+	 */
+	public async findAppByBundleId(bundleId: string): Promise<TestFlightApp | null> {
+		console.log(`🔍 Searching for app with bundle ID: ${bundleId}`);
+
+		try {
+			// First try the filtered approach (may fail with some API key configurations)
+			const params: TestFlightQueryParams = {
+				filter: {
+					bundleId: bundleId,
+				},
+				limit: 1,
+			};
+
+			console.log(`🔄 Attempting filtered search first...`);
+			const filteredApps = await this.getApps(params);
+
+			if (filteredApps.length > 0 && filteredApps[0]) {
+				console.log(`✅ Filtered search successful: ${filteredApps[0].attributes.name}`);
+				return filteredApps[0];
+			}
+
+			console.log(`⚠️ Filtered search returned no results, falling back to manual search`);
+		} catch (error) {
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			console.log(`⚠️ Filtered search failed (${errorMessage}), falling back to manual search`);
+		}
+
+		// Fallback: Get all apps and search manually (more reliable)
+		console.log(`🔄 Performing manual search across all apps...`);
+		try {
+			const allApps = await this.getApps({ limit: 200 }); // Increase limit to catch more apps
+
+			console.log(`📋 Searching through ${allApps.length} apps for bundle ID: ${bundleId}`);
+
+			const matchingApp = allApps.find(app =>
+				app.attributes.bundleId === bundleId
+			);
+
+			if (matchingApp) {
+				console.log(`✅ Manual search successful: ${matchingApp.attributes.name} (${matchingApp.id})`);
+				return matchingApp;
+			}
+
+			console.log(`❌ No app found with bundle ID: ${bundleId}`);
+			console.log(`📋 Available apps:`);
+			allApps.forEach(app => {
+				console.log(`  - ${app.attributes.name}: ${app.attributes.bundleId} (${app.id})`);
+			});
+
+			return null;
+		} catch (fallbackError) {
+			const fallbackErrorMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+			console.error(`❌ Manual search also failed: ${fallbackErrorMessage}`);
+			throw fallbackError;
+		}
+	}
+
+	/**
+	 * Gets a specific app by its ID for validation purposes
+	 */
+	public async getAppById(appId: string): Promise<TestFlightApp> {
+		const response = await this.makeApiRequest<{ data: TestFlightApp }>(
+			`/apps/${appId}`,
+			{
+				fields: {
+					apps: "bundleId,name,sku,primaryLocale"
+				}
+			}
+		);
+
+		return response.data;
+	}
+
+	/**
+	 * Gets crash submissions for a specific app
+	 */
+	public async getAppCrashSubmissions(
+		appId: string,
+		params?: TestFlightQueryParams,
+	): Promise<TestFlightCrashReport[]> {
+		const queryParams = {
+			limit: DEFAULT_TESTFLIGHT_CONFIG.DEFAULT_LIMIT,
+			sort: DEFAULT_TESTFLIGHT_CONFIG.DEFAULT_SORT,
+			...params,
+		};
+
+		const response = await this.makeApiRequest<AppBetaFeedbackCrashSubmissionsResponse>(
+			`/apps/${appId}/betaFeedbackCrashSubmissions`,
+			queryParams,
+		);
+
+		return response.data;
+	}
+
+	/**
+	 * Gets crash submissions for a specific app with date filtering
+	 * Handles the API's 'createdDate' field requirements and provides fallback filtering
+	 */
+	private async getAppCrashSubmissionsWithDateFilter(
+		appId: string,
+		since: Date,
+	): Promise<TestFlightCrashReport[]> {
+		try {
+			// First try with API-level date filtering using createdDate
+			const isoDate = since.toISOString();
+			const apiFilteredResults = await this.getAppCrashSubmissions(appId, {
+				filter: {
+					createdDate: `>${isoDate}`,
+				},
+				limit: 100,
+			});
+
+			console.log(`✅ API-level date filtering successful for crash submissions`);
+			return apiFilteredResults;
+		} catch (error) {
+			// If API filtering fails, fall back to fetching more data and filtering client-side
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			console.warn(`⚠️ API-level date filtering failed for crash submissions: ${errorMessage}`);
+			console.log(`🔄 Falling back to client-side filtering...`);
+
+			try {
+				// Fetch broader dataset (last 7 days worth to be safe)
+				const allRecentCrashes = await this.getAppCrashSubmissions(appId, {
+					limit: DEFAULT_TESTFLIGHT_CONFIG.MAX_LIMIT, // Get more results
+				});
+
+				// Filter client-side based on actual createdDate or submittedAt fields
+				const filteredCrashes = allRecentCrashes.filter(crash => {
+					const createdDate = new Date(crash.attributes.createdDate || crash.attributes.submittedAt || 0);
+					return createdDate >= since;
+				});
+
+				console.log(`✅ Client-side filtering successful: ${filteredCrashes.length}/${allRecentCrashes.length} crash submissions match date filter`);
+				return filteredCrashes;
+			} catch (fallbackError) {
+				console.error(`❌ Both API and client-side filtering failed for crash submissions:`, fallbackError);
+				throw fallbackError;
+			}
+		}
+	}
+
+	/**
+	 * Gets detailed information about a specific crash submission
+	 */
+	public async getDetailedCrashSubmission(
+		crashId: string,
+		params?: TestFlightQueryParams,
+	): Promise<DetailedTestFlightCrashReport> {
+		const response = await this.makeApiRequest<DetailedCrashSubmissionResponse>(
+			`/betaFeedbackCrashSubmissions/${crashId}`,
+			params,
+		);
+
+		return response.data;
+	}
+
+	/**
+	 * Gets the actual crash log content for a crash submission
+	 */
+	public async getCrashLog(
+		crashId: string,
+		params?: TestFlightQueryParams,
+	): Promise<TestFlightCrashLog> {
+		const response = await this.makeApiRequest<CrashLogResponse>(
+			`/betaFeedbackCrashSubmissions/${crashId}/crashLog`,
+			params,
+		);
+
+		return response.data;
+	}
+
+	/**
+	 * Gets crash log relationships for a crash submission
+	 */
+	public async getCrashLogRelationships(
+		crashId: string,
+	): Promise<CrashLogRelationshipsResponse> {
+		return await this.makeApiRequest<CrashLogRelationshipsResponse>(
+			`/betaFeedbackCrashSubmissions/${crashId}/relationships/crashLog`,
+		);
+	}
+
+	/**
+	 * Downloads the actual crash log content from the download URL
+	 */
+	public async downloadDetailedCrashLog(crashLog: TestFlightCrashLog): Promise<string | null> {
+		try {
+			// Check if URL hasn't expired
+			const expiresAt = new Date(crashLog.attributes.expiresAt);
+			if (expiresAt <= new Date()) {
+				console.warn(`Crash log download URL expired: ${crashLog.attributes.downloadUrl}`);
+				return null;
+			}
+
+			const response = await fetch(crashLog.attributes.downloadUrl, {
+				headers: {
+					"User-Agent": "TestFlight-PM/1.0",
+				},
+				signal: AbortSignal.timeout(this.defaultTimeout),
+			});
+
+			if (!response.ok) {
+				console.warn(
+					`Failed to download detailed crash log: ${response.status} ${response.statusText}`,
+				);
+				return null;
+			}
+
+			return await response.text();
+		} catch (error) {
+			console.warn(`Error downloading detailed crash log:`, error);
+			return null;
+		}
+	}
+
+	/**
+	 * Resolves and validates app ID using App Store Connect API as single source of truth
+	 * Ensures consistency between provided app_id and bundle_id when both are available
+	 * Enhanced with better error handling and user guidance
+	 */
+	public async resolveAppId(bundleId?: string): Promise<string> {
+		const providedAppId = this.appId;
+		const providedBundleId = bundleId;
+
+		// Case 1: Both app_id and bundle_id provided - validate consistency
+		if (providedAppId && providedBundleId) {
+			console.log(`🔍 Validating consistency between app_id: ${providedAppId} and bundle_id: ${providedBundleId}`);
+
+			try {
+				// Use API as single source of truth - fetch app by bundle ID
+				const appFromBundleId = await this.findAppByBundleId(providedBundleId);
+
+				if (!appFromBundleId) {
+					throw new Error(
+						`Bundle ID '${providedBundleId}' not found in App Store Connect. Please verify the bundle ID is correct and exists.`
+					);
+				}
+
+				// Validate that the provided app_id matches the API response
+				if (appFromBundleId.id !== providedAppId) {
+					console.warn(`⚠️ Inconsistency detected! Provided app_id: ${providedAppId} does not match API app_id: ${appFromBundleId.id} for bundle_id: ${providedBundleId}`);
+					console.warn(`📋 App Store Connect API shows: ${appFromBundleId.attributes.name} (${appFromBundleId.attributes.bundleId})`);
+					console.warn(`🔧 Using App Store Connect API as authoritative source: ${appFromBundleId.id}`);
+
+					// Use API response as authoritative (single source of truth)
+					return appFromBundleId.id;
+				}
+
+				console.log(`✅ Validated consistency: app_id ${providedAppId} matches bundle_id ${providedBundleId}`);
+				return providedAppId;
+
+			} catch (error) {
+				// Enhanced error handling with specific guidance
+				const errorMessage = error instanceof Error ? error.message : String(error);
+				console.warn(`⚠️ Bundle ID validation failed: ${errorMessage}`);
+				console.log(`🔍 Attempting to validate app_id: ${providedAppId} directly`);
+
+				try {
+					// Fetch app by app_id to validate it exists and get its bundle_id
+					const appFromAppId = await this.getAppById(providedAppId);
+
+					if (appFromAppId.attributes.bundleId !== providedBundleId) {
+						throw new Error(
+							`Inconsistent data: app_id '${providedAppId}' has bundle_id '${appFromAppId.attributes.bundleId}' but you provided bundle_id '${providedBundleId}'. Please check your configuration.`
+						);
+					}
+
+					console.log(`✅ Validated app_id ${providedAppId} exists and matches expected bundle_id`);
+					return providedAppId;
+
+				} catch (appIdError) {
+					const appIdErrorMessage = appIdError instanceof Error ? appIdError.message : String(appIdError);
+					throw new Error(
+						`App validation failed - neither app_id '${providedAppId}' nor bundle_id '${providedBundleId}' could be validated. Bundle ID Error: ${errorMessage}; App ID Error: ${appIdErrorMessage}`
+					);
+				}
+			}
+		}
+
+		// Case 2: Only app_id provided - validate it exists
+		if (providedAppId && !providedBundleId) {
+			console.log(`🔍 Validating app_id: ${providedAppId}`);
+
+			try {
+				const app = await this.getAppById(providedAppId);
+				console.log(`✅ Validated app_id ${providedAppId} - ${app.attributes.name} (${app.attributes.bundleId})`);
+				return providedAppId;
+			} catch (error) {
+				const errorMessage = error instanceof Error ? error.message : String(error);
+				throw new Error(
+					`App ID '${providedAppId}' not found in App Store Connect. Error: ${errorMessage}`
+				);
+			}
+		}
+
+		// Case 3: Only bundle_id provided - resolve app_id
+		if (!providedAppId && providedBundleId) {
+			console.log(`🔍 Resolving app_id from bundle_id: ${providedBundleId}`);
+
+			try {
+				const app = await this.findAppByBundleId(providedBundleId);
+				if (!app) {
+					throw new Error(
+						`No app found with bundle ID '${providedBundleId}' in your App Store Connect account.`
+					);
+				}
+
+				console.log(`✅ Resolved app_id ${app.id} from bundle_id ${providedBundleId} - ${app.attributes.name}`);
+				return app.id;
+			} catch (error) {
+				const errorMessage = error instanceof Error ? error.message : String(error);
+				throw new Error(
+					`Failed to resolve app_id from bundle_id '${providedBundleId}'. Error: ${errorMessage}`
+				);
+			}
+		}
+
+		// Case 4: Neither provided
+		throw new Error(
+			"Either app_id or testflight_bundle_id must be provided. Please set TESTFLIGHT_APP_ID or TESTFLIGHT_BUNDLE_ID environment variables, or provide app_id or testflight_bundle_id inputs."
+		);
+	}
+
+	/**
+	 * Enhanced method to get recent feedback with detailed crash logs
+	 * This is the main method to use for fetching TestFlight feedback
+	 */
+	public async getEnhancedRecentFeedback(
+		since: Date,
+		bundleId?: string,
+	): Promise<ProcessedFeedbackData[]> {
+		// Resolve app ID
+		const resolvedAppId = await this.resolveAppId(bundleId);
+
+		// Get crash submissions and screenshot feedback in parallel
+		// Note: Apple's API uses 'createdDate' not 'submittedAt' for filtering
+		const [crashes, screenshots] = await Promise.all([
+			this.getAppCrashSubmissionsWithDateFilter(resolvedAppId, since),
+			this.getAppScreenshotSubmissionsWithDateFilter(resolvedAppId, since),
+		]);
+
+		const processedData: ProcessedFeedbackData[] = [];
+
+		// Process crash reports with enhanced details
+		await this.processCrashReportsWithDetails(crashes, processedData);
+
+		// Process screenshot feedback  
+		await this.processScreenshotFeedbackData(screenshots, processedData);
+
+		// Sort by submission date (newest first)
+		processedData.sort((a, b) => b.submittedAt.getTime() - a.submittedAt.getTime());
+
+		return processedData;
+	}
+
+	/**
+	 * Legacy method - use getEnhancedRecentFeedback instead
+	 * @deprecated Use getEnhancedRecentFeedback for better performance and detailed crash logs
+	 */
+	public async getRecentFeedback(since: Date): Promise<ProcessedFeedbackData[]> {
+		return this.getEnhancedRecentFeedback(since);
+	}
+
+	/**
+	 * Makes an authenticated API request with enhanced retry logic and rate limiting
+	 * Includes better error categorization and exponential backoff
 	 */
 	private async makeApiRequest<T>(
 		endpoint: string,
@@ -239,6 +758,7 @@ export class TestFlightClient {
 		} = options || {};
 
 		let lastError: Error | null = null;
+		let lastStatusCode: number | null = null;
 
 		for (let attempt = 0; attempt <= retries; attempt++) {
 			try {
@@ -252,6 +772,8 @@ export class TestFlightClient {
 				// Build URL with query parameters
 				const url = this.buildUrl(endpoint, params);
 
+				console.log(`🔗 API Request (attempt ${attempt + 1}/${retries + 1}): ${url.toString()}`);
+
 				// Make the request
 				const response = await fetch(url, {
 					method: "GET",
@@ -262,6 +784,8 @@ export class TestFlightClient {
 					},
 					signal: AbortSignal.timeout(timeout),
 				});
+
+				lastStatusCode = response.status;
 
 				// Update rate limit info
 				this.updateRateLimitInfo(response);
@@ -280,44 +804,130 @@ export class TestFlightClient {
 					const errorMessage = errorData.errors
 						.map((e) => `${e.title}: ${e.detail}`)
 						.join("; ");
-					throw new Error(`API Error: ${errorMessage}`);
+
+					// Enhanced error handling with retry logic
+					const apiError = new Error(`API Error: ${errorMessage}`);
+
+					// Determine if this is a retryable error
+					const isRetryable = this.isRetryableError(response.status, errorMessage);
+
+					if (!isRetryable) {
+						console.log(`❌ Non-retryable error (${response.status}): ${errorMessage}`);
+						throw apiError;
+					}
+
+					console.log(`⚠️ Retryable error (${response.status}): ${errorMessage}`);
+					throw apiError;
 				}
 
 				// Parse and return response
 				const data = await response.json();
+				console.log(`✅ API Request successful (attempt ${attempt + 1})`);
 				return data as T;
 			} catch (error) {
 				lastError = error as Error;
 
-				// Don't retry on authentication errors
+				// Don't retry on authentication errors (401, 403)
 				if (
 					lastError.message.includes("authentication") ||
-					lastError.message.includes("unauthorized")
+					lastError.message.includes("unauthorized") ||
+					lastStatusCode === 401 ||
+					lastStatusCode === 403
 				) {
+					console.log(`❌ Authentication error - not retrying: ${lastError.message}`);
+					throw lastError;
+				}
+
+				// Don't retry on client errors (400, 404) - these are configuration issues
+				if (lastStatusCode && lastStatusCode >= 400 && lastStatusCode < 500 && lastStatusCode !== 429) {
+					console.log(`❌ Client error (${lastStatusCode}) - not retrying: ${lastError.message}`);
 					throw lastError;
 				}
 
 				// Don't retry on the last attempt
 				if (attempt === retries) {
+					console.log(`❌ Final attempt failed: ${lastError.message}`);
 					break;
 				}
 
-				// Wait before retrying (exponential backoff)
-				const delay = retryDelay * 2 ** attempt;
+				// Calculate delay with exponential backoff and jitter
+				const baseDelay = retryDelay * Math.pow(2, attempt);
+				const jitter = Math.random() * 0.1 * baseDelay; // Add up to 10% jitter
+				const delay = Math.floor(baseDelay + jitter);
+
+				console.log(`🔄 Retrying in ${delay}ms (attempt ${attempt + 1}/${retries + 1}): ${lastError.message}`);
 				await this.sleep(delay);
 			}
 		}
 
-		throw new Error(
-			`Request failed after ${retries + 1} attempts: ${lastError?.message}`,
+		// Enhanced final error message
+		const finalError = new Error(
+			`Request failed after ${retries + 1} attempts: ${lastError?.message}${lastStatusCode ? ` (HTTP ${lastStatusCode})` : ''}`
 		);
+
+		// Add additional context for common issues
+		if (lastStatusCode === 404 || lastError?.message.includes("The specified resource does not exist")) {
+			console.error(`🔍 This appears to be a resource not found error. Check your app_id/bundle_id and API key permissions.`);
+		}
+
+		throw finalError;
+	}
+
+	/**
+	 * Determines if an error is retryable based on status code and error message
+	 */
+	private isRetryableError(statusCode: number, errorMessage: string): boolean {
+		// Rate limiting - always retry
+		if (statusCode === 429) {
+			return true;
+		}
+
+		// Server errors - retry
+		if (statusCode >= 500) {
+			return true;
+		}
+
+		// Timeout or network errors - retry
+		if (errorMessage.includes("timeout") || errorMessage.includes("network")) {
+			return true;
+		}
+
+		// Temporary Apple API issues (sometimes happens intermittently)
+		if (errorMessage.includes("temporarily unavailable") ||
+			errorMessage.includes("service unavailable")) {
+			return true;
+		}
+
+		// Don't retry client errors (400-499, except 429)
+		if (statusCode >= 400 && statusCode < 500) {
+			return false;
+		}
+
+		// Default to not retrying unknown errors
+		return false;
 	}
 
 	/**
 	 * Builds a complete URL with query parameters
+	 * Properly handles endpoints that start with "/" to avoid replacing the base path
 	 */
 	private buildUrl(endpoint: string, params?: TestFlightQueryParams): string {
-		const url = new URL(endpoint, this.baseUrl);
+		// Fix: If endpoint starts with "/", we need to properly append it to baseUrl
+		// new URL("/apps", "https://api.appstoreconnect.apple.com/v1") would incorrectly become 
+		// "https://api.appstoreconnect.apple.com/apps" (losing /v1)
+		// Instead, we should get "https://api.appstoreconnect.apple.com/v1/apps"
+		let fullUrl: string;
+		if (endpoint.startsWith('/')) {
+			// Append endpoint to baseUrl, ensuring no double slashes
+			fullUrl = this.baseUrl.endsWith('/')
+				? this.baseUrl + endpoint.slice(1)
+				: this.baseUrl + endpoint;
+		} else {
+			// Use standard URL constructor for relative paths
+			fullUrl = new URL(endpoint, this.baseUrl).toString();
+		}
+
+		const url = new URL(fullUrl);
 
 		if (params) {
 			if (params.limit) {
@@ -388,67 +998,311 @@ export class TestFlightClient {
 	}
 
 	/**
+	 * Processes crash reports with enhanced details (including detailed crash logs and system metadata)
+	 */
+	private async processCrashReportsWithDetails(
+		crashes: TestFlightCrashReport[],
+		processedData: ProcessedFeedbackData[],
+	): Promise<void> {
+		for (const crash of crashes) {
+			let processedCrash = this.processCrashReport(crash);
+
+			// ENHANCEMENT: Get detailed crash submission metadata for richer debugging context
+			try {
+				console.log(`🔍 Fetching enhanced crash metadata for ${crash.id}`);
+				const detailedCrash = await this.getDetailedCrashSubmission(crash.id, {
+					include: "build,tester",
+					fields: {
+						betaFeedbackCrashSubmissions: [
+							"createdDate", "comment", "email", "deviceModel", "osVersion",
+							"batteryPercentage", "appUptimeInMilliseconds", "connectionType",
+							"diskBytesAvailable", "diskBytesTotal", "architecture",
+							"pairedAppleWatch", "screenWidthInPoints", "screenHeightInPoints"
+						].join(",")
+					}
+				});
+
+				// Merge enhanced metadata into processed crash
+				processedCrash = this.mergeEnhancedCrashMetadata(processedCrash, detailedCrash);
+				console.log(`✅ Enhanced crash metadata obtained for ${crash.id}`);
+			} catch (error) {
+				console.warn(`⚠️ Failed to get enhanced crash metadata for ${crash.id}:`, error);
+				// Continue with basic data if enhanced fails
+			}
+
+			// Get detailed crash log content
+			try {
+				const crashLog = await this.getCrashLog(crash.id);
+				const detailedLogContent = await this.downloadDetailedCrashLog(crashLog);
+
+				if (detailedLogContent && processedCrash.crashData) {
+					processedCrash.crashData.detailedLogs = [detailedLogContent];
+				}
+			} catch (error) {
+				console.warn(`Failed to get detailed crash log for ${crash.id}:`, error);
+			}
+
+			processedData.push(processedCrash);
+		}
+	}
+
+	/**
+	 * Processes screenshot feedback data with enhanced details (including detailed screenshot info)
+	 */
+	private async processScreenshotFeedbackData(
+		screenshots: TestFlightScreenshotFeedback[],
+		processedData: ProcessedFeedbackData[],
+	): Promise<void> {
+		for (const screenshot of screenshots) {
+			const processedScreenshot = this.processScreenshotFeedback(screenshot);
+
+			// ENHANCEMENT: Get detailed screenshot submission with optimized field selection
+			try {
+				console.log(`🔍 Fetching enhanced screenshot metadata for ${screenshot.id}`);
+				const detailedScreenshot = await this.getDetailedScreenshotSubmission(screenshot.id, {
+					include: "build,tester",
+					fields: {
+						betaFeedbackScreenshotSubmissions: [
+							"createdDate", "comment", "email", "deviceModel", "osVersion",
+							"batteryPercentage", "appUptimeInMilliseconds", "connectionType",
+							"diskBytesAvailable", "diskBytesTotal", "architecture",
+							"pairedAppleWatch", "screenWidthInPoints", "screenHeightInPoints",
+							"applicationState", "memoryPressure", "batteryLevel", "batteryState",
+							"thermalState", "diskSpaceRemaining", "submissionMethod", "testerNotes",
+							"screenshots"
+						].join(",")
+					}
+				});
+
+				if (processedScreenshot.screenshotData) {
+					// Add enhanced screenshot information
+					processedScreenshot.screenshotData.testerNotes = detailedScreenshot.attributes.testerNotes;
+					processedScreenshot.screenshotData.submissionMethod = detailedScreenshot.attributes.submissionMethod;
+
+					// Add system information if available
+					processedScreenshot.screenshotData.systemInfo = {
+						applicationState: detailedScreenshot.attributes.applicationState,
+						memoryPressure: detailedScreenshot.attributes.memoryPressure,
+						batteryLevel: detailedScreenshot.attributes.batteryLevel,
+						batteryState: detailedScreenshot.attributes.batteryState,
+						thermalState: detailedScreenshot.attributes.thermalState,
+						diskSpaceRemaining: detailedScreenshot.attributes.diskSpaceRemaining,
+					};
+
+					// Process enhanced screenshot images if available
+					if (detailedScreenshot.attributes.screenshots) {
+						processedScreenshot.screenshotData.enhancedImages =
+							await this.processEnhancedScreenshotImages(detailedScreenshot.attributes.screenshots);
+					}
+				}
+
+				console.log(`✅ Enhanced screenshot metadata obtained for ${screenshot.id}`);
+			} catch (error) {
+				console.warn(`⚠️ Failed to get enhanced screenshot metadata for ${screenshot.id}:`, error);
+				// Continue with basic data if enhanced fails
+			}
+
+			processedData.push(processedScreenshot);
+		}
+	}
+
+	/**
+	 * Processes enhanced screenshot images with additional metadata
+	 */
+	private async processEnhancedScreenshotImages(
+		screenshots: TestFlightScreenshotFeedback["attributes"]["screenshots"],
+	): Promise<EnhancedScreenshotImage[]> {
+		return screenshots.map((screenshot, index) => ({
+			url: screenshot.url,
+			fileName: screenshot.fileName,
+			fileSize: screenshot.fileSize,
+			expiresAt: new Date(screenshot.expiresAt),
+			// Additional enhanced properties (would be available from Apple's detailed API)
+			imageFormat: this.extractImageFormat(screenshot.fileName),
+			imageScale: 1.0, // Default scale, could be enhanced with actual data
+			imageDimensions: {
+				width: 0, // Would be provided by detailed API
+				height: 0, // Would be provided by detailed API
+			},
+			compressionQuality: 0.8, // Default quality
+			metadata: {
+				index,
+				processingTime: new Date().toISOString(),
+			},
+		}));
+	}
+
+	/**
+	 * Extracts image format from filename
+	 */
+	private extractImageFormat(fileName: string): "png" | "jpeg" | "heic" {
+		const extension = fileName.toLowerCase().split('.').pop();
+		switch (extension) {
+			case 'png':
+				return 'png';
+			case 'jpg':
+			case 'jpeg':
+				return 'jpeg';
+			case 'heic':
+				return 'heic';
+			default:
+				return 'png'; // Default fallback
+		}
+	}
+
+	/**
 	 * Processes raw crash report data into standardized format
+	 * Handles both real API fields and legacy field names for backward compatibility
 	 */
 	private processCrashReport(
 		crash: TestFlightCrashReport,
 	): ProcessedFeedbackData {
+		const attrs = crash.attributes;
+
+		// Use real API fields with fallbacks to legacy fields
+		const submittedAt = attrs.createdDate || attrs.submittedAt || new Date().toISOString();
+		const bundleId = attrs.buildBundleId || attrs.bundleId || '';
+		const deviceFamily = attrs.deviceFamily || 'UNKNOWN';
+
+		// Extract app version and build number from other available data if not directly provided
+		// Note: Real API may not always include these fields in crash submissions
+		const appVersion = attrs.appVersion || 'Unknown';
+		const buildNumber = attrs.buildNumber || 'Unknown';
+
 		return {
 			id: crash.id,
 			type: "crash",
-			submittedAt: new Date(crash.attributes.submittedAt),
-			appVersion: crash.attributes.appVersion,
-			buildNumber: crash.attributes.buildNumber,
+			submittedAt: new Date(submittedAt),
+			appVersion,
+			buildNumber,
 			deviceInfo: {
-				family: crash.attributes.deviceFamily,
-				model: crash.attributes.deviceModel,
-				osVersion: crash.attributes.osVersion,
-				locale: crash.attributes.locale,
+				family: deviceFamily,
+				model: attrs.deviceModel,
+				osVersion: attrs.osVersion,
+				locale: attrs.locale,
 			},
-			bundleId: crash.attributes.bundleId,
+			bundleId,
+			testerInfo: attrs.email ? {
+				email: attrs.email,
+			} : undefined,
 			crashData: {
-				trace: crash.attributes.crashTrace,
-				type: crash.attributes.crashType,
-				exceptionType: crash.attributes.exceptionType,
-				exceptionMessage: crash.attributes.exceptionMessage,
-				logs: crash.attributes.crashLogs.map((log) => ({
+				// Real API may not have crash trace/type directly in submission
+				// These might be in the related crashLog resource
+				trace: attrs.crashTrace || '',
+				type: attrs.crashType || 'Unknown',
+				exceptionType: attrs.exceptionType,
+				exceptionMessage: attrs.exceptionMessage,
+				logs: attrs.crashLogs?.map((log) => ({
 					url: log.url,
 					expiresAt: new Date(log.expiresAt),
-				})),
+				})) || [],
 			},
 		};
 	}
 
 	/**
 	 * Processes raw screenshot feedback data into standardized format
+	 * Handles both real API fields and legacy field names for backward compatibility
 	 */
 	private processScreenshotFeedback(
 		screenshot: TestFlightScreenshotFeedback,
 	): ProcessedFeedbackData {
+		const attrs = screenshot.attributes;
+
+		// Use real API fields with fallbacks to legacy fields
+		const submittedAt = attrs.createdDate || attrs.submittedAt || new Date().toISOString();
+		const bundleId = attrs.buildBundleId || attrs.bundleId || '';
+		const deviceFamily = attrs.deviceFamily || 'UNKNOWN';
+		const feedbackText = attrs.comment || attrs.feedbackText || '';
+
+		// Extract app version and build number from other available data if not directly provided
+		const appVersion = attrs.appVersion || 'Unknown';
+		const buildNumber = attrs.buildNumber || 'Unknown';
+
 		return {
 			id: screenshot.id,
 			type: "screenshot",
-			submittedAt: new Date(screenshot.attributes.submittedAt),
-			appVersion: screenshot.attributes.appVersion,
-			buildNumber: screenshot.attributes.buildNumber,
+			submittedAt: new Date(submittedAt),
+			appVersion,
+			buildNumber,
 			deviceInfo: {
-				family: screenshot.attributes.deviceFamily,
-				model: screenshot.attributes.deviceModel,
-				osVersion: screenshot.attributes.osVersion,
-				locale: screenshot.attributes.locale,
+				family: deviceFamily,
+				model: attrs.deviceModel,
+				osVersion: attrs.osVersion,
+				locale: attrs.locale,
 			},
-			bundleId: screenshot.attributes.bundleId,
+			bundleId,
+			testerInfo: attrs.email ? {
+				email: attrs.email,
+			} : undefined,
 			screenshotData: {
-				text: screenshot.attributes.feedbackText,
-				images: screenshot.attributes.screenshots.map((img) => ({
+				text: feedbackText,
+				images: attrs.screenshots.map((img) => ({
 					url: img.url,
 					fileName: img.fileName,
 					fileSize: img.fileSize,
 					expiresAt: new Date(img.expiresAt),
 				})),
-				annotations: screenshot.attributes.annotations,
+				annotations: attrs.annotations || [],
 			},
 		};
+	}
+
+	/**
+	 * Merges enhanced crash metadata from detailed API response into processed crash data
+	 */
+	private mergeEnhancedCrashMetadata(
+		processedCrash: ProcessedFeedbackData,
+		detailedCrash: DetailedTestFlightCrashReport,
+	): ProcessedFeedbackData {
+		if (!processedCrash.crashData) {
+			return processedCrash;
+		}
+
+		const attrs = detailedCrash.attributes;
+
+		// Add enhanced system information
+		const enhancedCrashData = {
+			...processedCrash.crashData,
+			systemInfo: {
+				batteryPercentage: attrs.batteryPercentage,
+				appUptimeInMilliseconds: attrs.appUptimeInMilliseconds,
+				connectionType: attrs.connectionType,
+				diskBytesAvailable: attrs.diskBytesAvailable,
+				diskBytesTotal: attrs.diskBytesTotal,
+				architecture: attrs.architecture,
+				pairedAppleWatch: attrs.pairedAppleWatch,
+				screenDimensions: {
+					width: attrs.screenWidthInPoints,
+					height: attrs.screenHeightInPoints,
+				},
+				// Derived/computed fields for better UX
+				diskSpaceRemainingGB: attrs.diskBytesAvailable ?
+					Math.round((attrs.diskBytesAvailable / (1024 ** 3)) * 10) / 10 : null,
+				appUptimeFormatted: attrs.appUptimeInMilliseconds ?
+					this.formatUptime(attrs.appUptimeInMilliseconds) : null,
+			}
+		};
+
+		return {
+			...processedCrash,
+			crashData: enhancedCrashData,
+		};
+	}
+
+	/**
+	 * Formats uptime milliseconds into human-readable format
+	 */
+	private formatUptime(uptimeMs: number): string {
+		const seconds = Math.floor(uptimeMs / 1000);
+		const minutes = Math.floor(seconds / 60);
+		const hours = Math.floor(minutes / 60);
+		const days = Math.floor(hours / 24);
+
+		if (days > 0) return `${days}d ${hours % 24}h ${minutes % 60}m`;
+		if (hours > 0) return `${hours}h ${minutes % 60}m`;
+		if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
+		return `${seconds}s`;
 	}
 
 	/**

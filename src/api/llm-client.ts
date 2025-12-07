@@ -18,6 +18,7 @@ import type {
 	LLMUsageStats,
 } from "../config/llm-config.js";
 import { getLLMConfig, validateLLMConfig } from "../config/llm-config.js";
+import { DEFAULT_LLM_MODELS } from "../config/defaults.js";
 
 export interface LLMMessage {
 	role: "system" | "user" | "assistant";
@@ -247,30 +248,32 @@ export class LLMClient {
 					await this.validateCostLimits(request, options, currentProvider);
 				}
 
-				// Convert to universal format using llm-bridge
-				let universalRequest: UniversalBody | LLMRequest;
-				try {
-					universalRequest = toUniversal(currentProvider, request);
-					if (!universalRequest) {
-						universalRequest = request;
-					}
-				} catch {
-					universalRequest = request;
+				// Get provider configuration
+				const providerConfig = this.config.providers[currentProvider];
+				if (!providerConfig) {
+					throw new Error(`Provider ${currentProvider} not configured`);
 				}
 
-				// Make the actual API call
-				const rawResponse = await this.callProviderAPI(
+				// Convert to universal format using llm-bridge
+				const universalRequest = toUniversal(currentProvider, {
+					...request,
+					model: request.model || providerConfig.model,
+				});
+
+				// Convert universal format back to provider-specific format
+				const providerSpecificRequest = fromUniversal(currentProvider, universalRequest);
+
+				// Make unified API call using llm-bridge converted format
+				const rawResponse = await this.makeUnifiedAPICall(
 					currentProvider,
-					universalRequest,
+					providerSpecificRequest,
+					providerConfig,
 					options,
 				);
 
-				// Convert response back using llm-bridge
-				const universalResponse = fromUniversal(currentProvider, rawResponse as any);
-
-				// Convert to our internal format
+				// Convert response to our internal format
 				const llmResponse = this.convertUniversalToLLMResponse(
-					universalResponse,
+					rawResponse,
 					currentProvider,
 				);
 
@@ -344,7 +347,7 @@ export class LLMClient {
 		}
 
 		if (availableProviders.length === 1) {
-			return availableProviders[0]!;
+			return availableProviders[0] as LLMProvider;
 		}
 
 		// If user prefers cheapest option, calculate costs
@@ -485,33 +488,34 @@ export class LLMClient {
 	}
 
 	/**
-	 * Make the actual API call to the provider
+	 * Make unified API call using llm-bridge converted format
+	 * This replaces provider-specific HTTP logic with a universal approach
 	 */
-	private async callProviderAPI(
+	private async makeUnifiedAPICall(
 		provider: LLMProvider,
-		universalRequest: UniversalBody | LLMRequest,
+		providerSpecificRequest: Record<string, unknown>,
+		providerConfig: { apiKey: string; model?: string },
 		options: LLMRequestOptions,
 	): Promise<unknown> {
-		const providerConfig = this.config.providers[provider];
-		if (!providerConfig) {
-			throw new Error(`Provider ${provider} not configured`);
-		}
-
 		const timeout = options.timeout || 30000;
 		const controller = new AbortController();
 		const timeoutId = setTimeout(() => controller.abort(), timeout);
 
 		try {
-			const { endpoint, headers, body } = this.prepareProviderRequest(
+			// Get provider configuration using llm-bridge provider adapter patterns
+			const { endpoint, headers } = this.getProviderEndpointConfig(
 				provider,
-				universalRequest,
 				providerConfig,
+				providerSpecificRequest,
 			);
 
 			const response = await fetch(endpoint, {
 				method: "POST",
-				headers,
-				body: JSON.stringify(body),
+				headers: {
+					...headers,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify(providerSpecificRequest),
 				signal: controller.signal,
 			});
 
@@ -529,22 +533,18 @@ export class LLMClient {
 	}
 
 	/**
-	 * Prepare provider-specific request configuration
+	 * Get provider endpoint configuration - simplified and universal
 	 */
-	private prepareProviderRequest(
+	private getProviderEndpointConfig(
 		provider: LLMProvider,
-		universalRequest: UniversalBody | LLMRequest,
 		providerConfig: { apiKey: string; model?: string },
-	): { endpoint: string; headers: Record<string, string>; body: unknown } {
+		request: Record<string, unknown>,
+	): { endpoint: string; headers: Record<string, string> } {
 		switch (provider) {
 			case "openai":
 				return {
 					endpoint: "https://api.openai.com/v1/chat/completions",
-					headers: {
-						Authorization: `Bearer ${providerConfig.apiKey}`,
-						"Content-Type": "application/json",
-					},
-					body: universalRequest,
+					headers: { Authorization: `Bearer ${providerConfig.apiKey}` },
 				};
 
 			case "anthropic":
@@ -553,18 +553,13 @@ export class LLMClient {
 					headers: {
 						"x-api-key": providerConfig.apiKey,
 						"anthropic-version": "2023-06-01",
-						"Content-Type": "application/json",
 					},
-					body: universalRequest,
 				};
 
 			case "google":
 				return {
-					endpoint: `https://generativelanguage.googleapis.com/v1beta/models/${universalRequest.model || "gemini-pro"}:generateContent?key=${providerConfig.apiKey}`,
-					headers: {
-						"Content-Type": "application/json",
-					},
-					body: universalRequest,
+					endpoint: `https://generativelanguage.googleapis.com/v1beta/models/${request.model || providerConfig.model || DEFAULT_LLM_MODELS.google}:generateContent?key=${providerConfig.apiKey}`,
+					headers: {},
 				};
 
 			default:
@@ -702,19 +697,15 @@ Context:
 - You have access to codebase context and recent changes
 - Provide actionable insights and technical recommendations
 
-Response Format (JSON):
-{
-  "enhancedTitle": "Clear, technical title",
-  "enhancedDescription": "Detailed technical description with context",
-  "priority": "urgent|high|medium|low",
-  "labels": ["bug", "crash", "ios", ...],
-  "analysis": {
-    "rootCause": "Technical analysis of the cause",
-    "affectedComponents": ["component1", "component2"],
-    "suggestedFix": "Specific technical recommendations",
-    "confidence": 0.95
-  }
-}`;
+You must use the enhance_issue function to provide a structured response with your analysis. 
+
+Guidelines:
+- Create clear, descriptive titles that summarize the technical issue
+- Write detailed descriptions with technical context and analysis
+- Set appropriate priority based on severity and impact (urgent: system crashes/data loss, high: major features broken, medium: noticeable issues, low: minor improvements)
+- Add relevant labels for categorization (e.g., bug, crash, ios, ui, performance, memory, networking)
+- Provide thorough analysis with root cause investigation, affected components, and specific actionable recommendations
+- Set confidence level based on available evidence and codebase context`;
 
 		const userContent: Array<{ type: "text"; text: string }> = [
 			{
@@ -785,6 +776,68 @@ ${request.crashData.trace.join("\n")}
 			],
 			temperature: 0.3,
 			max_tokens: 2000,
+			tools: [
+				{
+					type: "function",
+					function: {
+						name: "enhance_issue",
+						description: "Enhance a TestFlight issue with detailed technical analysis and structured metadata",
+						parameters: {
+							type: "object",
+							properties: {
+								enhancedTitle: {
+									type: "string",
+									description: "Clear, concise technical title that accurately describes the issue"
+								},
+								enhancedDescription: {
+									type: "string",
+									description: "Detailed technical description with context, analysis, and actionable insights"
+								},
+								priority: {
+									type: "string",
+									enum: ["urgent", "high", "medium", "low"],
+									description: "Issue priority based on severity and impact analysis"
+								},
+								labels: {
+									type: "array",
+									items: {
+										type: "string"
+									},
+									description: "Relevant labels for categorization (e.g., bug, crash, ios, ui, performance)"
+								},
+								analysis: {
+									type: "object",
+									properties: {
+										rootCause: {
+											type: "string",
+											description: "Technical analysis of the likely root cause"
+										},
+										affectedComponents: {
+											type: "array",
+											items: {
+												type: "string"
+											},
+											description: "List of code components, files, or modules likely affected"
+										},
+										suggestedFix: {
+											type: "string",
+											description: "Specific, actionable technical recommendations for resolution"
+										},
+										confidence: {
+											type: "number",
+											minimum: 0,
+											maximum: 1,
+											description: "Confidence level in the analysis (0.0 to 1.0)"
+										}
+									},
+									required: ["rootCause", "affectedComponents", "suggestedFix", "confidence"]
+								}
+							},
+							required: ["enhancedTitle", "enhancedDescription", "priority", "labels", "analysis"]
+						}
+					}
+				}
+			]
 		};
 	}
 
@@ -795,8 +848,45 @@ ${request.crashData.trace.join("\n")}
 		response: LLMResponse,
 		startTime: number,
 	): LLMEnhancementResponse {
+		// First, check if we have structured function calling response
+		if (response.metadata?.tool_calls?.length) {
+			const toolCall = response.metadata.tool_calls.find(
+				(call) => call.function.name === "enhance_issue"
+			);
+
+			if (toolCall) {
+				try {
+					const enhancementData = JSON.parse(toolCall.function.arguments);
+					return {
+						enhancedTitle: enhancementData.enhancedTitle || "Enhanced Issue",
+						enhancedDescription: enhancementData.enhancedDescription || response.content,
+						priority: enhancementData.priority || "medium",
+						labels: Array.isArray(enhancementData.labels) ? enhancementData.labels : ["testflight"],
+						analysis: {
+							rootCause: enhancementData.analysis?.rootCause || "Unknown",
+							affectedComponents: Array.isArray(enhancementData.analysis?.affectedComponents)
+								? enhancementData.analysis.affectedComponents
+								: [],
+							suggestedFix: enhancementData.analysis?.suggestedFix || "Review required",
+							confidence: typeof enhancementData.analysis?.confidence === "number"
+								? enhancementData.analysis.confidence
+								: 0.7,
+						},
+						metadata: {
+							provider: response.provider,
+							model: response.model,
+							processingTime: Date.now() - startTime,
+							cost: response.cost,
+						},
+					};
+				} catch (error) {
+					console.warn(`Failed to parse structured function call response: ${error}`);
+				}
+			}
+		}
+
+		// Fallback: Try to parse JSON from content (backward compatibility)
 		try {
-			// Try to parse JSON response
 			const content = response.content.trim();
 			const jsonMatch = content.match(/\{[\s\S]*\}/);
 			if (jsonMatch) {
@@ -807,14 +897,14 @@ ${request.crashData.trace.join("\n")}
 					priority: parsed.priority || "medium",
 					labels: Array.isArray(parsed.labels) ? parsed.labels : ["testflight"],
 					analysis: {
-						rootCause: parsed.analysis?.rootCause,
-						affectedComponents: Array.isArray(
-							parsed.analysis?.affectedComponents,
-						)
+						rootCause: parsed.analysis?.rootCause || "Unknown",
+						affectedComponents: Array.isArray(parsed.analysis?.affectedComponents)
 							? parsed.analysis.affectedComponents
 							: [],
-						suggestedFix: parsed.analysis?.suggestedFix,
-						confidence: parsed.analysis?.confidence || 0.6,
+						suggestedFix: parsed.analysis?.suggestedFix || "Review required",
+						confidence: typeof parsed.analysis?.confidence === "number"
+							? parsed.analysis.confidence
+							: 0.7,
 					},
 					metadata: {
 						provider: response.provider,
@@ -828,7 +918,7 @@ ${request.crashData.trace.join("\n")}
 			console.warn(`Failed to parse LLM response as JSON: ${error}`);
 		}
 
-		// Fallback to unstructured parsing
+		// Final fallback to unstructured parsing
 		return this.parseUnstructuredResponse(response, startTime);
 	}
 
@@ -839,7 +929,7 @@ ${request.crashData.trace.join("\n")}
 		response: LLMResponse,
 		startTime: number,
 	): LLMEnhancementResponse {
-		const content = response.content;
+		const { content } = response;
 		const lines = content.split("\n");
 
 		// Extract title (first meaningful line)
@@ -849,10 +939,15 @@ ${request.crashData.trace.join("\n")}
 
 		// Basic label detection
 		const labels = ["testflight"];
-		if (content.toLowerCase().includes("crash")) labels.push("crash", "bug");
-		if (content.toLowerCase().includes("ui")) labels.push("ui");
-		if (content.toLowerCase().includes("performance"))
+		if (content.toLowerCase().includes("crash")) {
+			labels.push("crash", "bug");
+		}
+		if (content.toLowerCase().includes("ui")) {
+			labels.push("ui");
+		}
+		if (content.toLowerCase().includes("performance")) {
 			labels.push("performance");
+		}
 
 		// Basic priority detection
 		let priority: "urgent" | "high" | "medium" | "low" = "medium";
@@ -1003,6 +1098,49 @@ ${request.codebaseContext.length} relevant file(s) identified for analysis.`
 	public async healthCheck(): Promise<LLMHealthCheck> {
 		const configValidation = validateLLMConfig(this.config);
 
+		// If LLM enhancement is disabled, treat as optional/degraded rather than unhealthy
+		if (!this.config.enabled) {
+			return {
+				status: "degraded",
+				providers: {
+					openai: { available: false, authenticated: false },
+					anthropic: { available: false, authenticated: false },
+					google: { available: false, authenticated: false },
+				},
+				config: configValidation,
+				usage: this.usageStats,
+				costStatus: {
+					withinLimits: true,
+					remainingBudget: {
+						run: this.config.costControls.maxCostPerRun,
+						month: this.config.costControls.maxCostPerMonth,
+					},
+				},
+			};
+		}
+
+		// If enabled but no API keys are configured, treat as degraded not unhealthy
+		const availableProviders = this.getAvailableProviders();
+		if (availableProviders.length === 0) {
+			return {
+				status: "degraded",
+				providers: {
+					openai: { available: false, authenticated: false, error: "No API key configured" },
+					anthropic: { available: false, authenticated: false, error: "No API key configured" },
+					google: { available: false, authenticated: false, error: "No API key configured" },
+				},
+				config: configValidation,
+				usage: this.usageStats,
+				costStatus: {
+					withinLimits: true,
+					remainingBudget: {
+						run: this.config.costControls.maxCostPerRun,
+						month: this.config.costControls.maxCostPerMonth,
+					},
+				},
+			};
+		}
+
 		// Mock cost check since we removed the function
 		const costCheck = {
 			withinLimits: true,
@@ -1017,12 +1155,19 @@ ${request.codebaseContext.length} relevant file(s) identified for analysis.`
 			},
 		};
 
-		// Test provider connectivity
-		const providerChecks = await Promise.allSettled([
-			this.testProvider("openai"),
-			this.testProvider("anthropic"),
-			this.testProvider("google"),
-		]);
+		// Test provider connectivity only for selected providers with API keys
+		const selectedProviders = [
+			this.config.primaryProvider,
+			...this.config.fallbackProviders
+		].filter((provider, index, array) => {
+			// Remove duplicates and only include providers with API keys
+			return array.indexOf(provider) === index &&
+				this.config.providers[provider]?.apiKey?.trim();
+		});
+
+		const providerChecks = await Promise.allSettled(
+			selectedProviders.map(provider => this.testProvider(provider))
+		);
 
 		const providers: LLMHealthCheck["providers"] = {
 			openai: { available: false, authenticated: false },
@@ -1031,9 +1176,11 @@ ${request.codebaseContext.length} relevant file(s) identified for analysis.`
 		};
 
 		providerChecks.forEach((result, index) => {
-			const providerName = ["openai", "anthropic", "google"][
-				index
-			] as LLMProvider;
+			const providerName = selectedProviders[index];
+			if (!providerName) {
+				return;
+			} // Guard against undefined
+
 			if (result.status === "fulfilled") {
 				providers[providerName] = result.value;
 			} else {
@@ -1048,12 +1195,21 @@ ${request.codebaseContext.length} relevant file(s) identified for analysis.`
 		const healthyProviders = Object.values(providers).filter(
 			(p) => p.available && p.authenticated,
 		).length;
-		const status: LLMHealthCheck["status"] =
-			healthyProviders === 0
-				? "unhealthy"
-				: healthyProviders === 1
-					? "degraded"
-					: "healthy";
+		const totalConfiguredProviders = selectedProviders.length;
+
+		// More lenient status calculation - only unhealthy if all providers fail with serious errors
+		let status: LLMHealthCheck["status"];
+		if (healthyProviders === 0) {
+			// Check if it's just missing API keys (degraded) vs real failures (unhealthy)
+			const hasRealFailures = Object.values(providers).some(p =>
+				p.error && !p.error.includes("No API key") && !p.error.includes("API key missing")
+			);
+			status = hasRealFailures ? "unhealthy" : "degraded";
+		} else if (healthyProviders < totalConfiguredProviders) {
+			status = "degraded";
+		} else {
+			status = "healthy";
+		}
 
 		return {
 			status,
@@ -1065,7 +1221,7 @@ ${request.codebaseContext.length} relevant file(s) identified for analysis.`
 	}
 
 	/**
-	 * Test individual provider connectivity
+	 * Test individual provider configuration (without making API calls)
 	 */
 	private async testProvider(provider: LLMProvider): Promise<{
 		available: boolean;
@@ -1076,18 +1232,46 @@ ${request.codebaseContext.length} relevant file(s) identified for analysis.`
 		try {
 			const startTime = Date.now();
 
-			// Simple test request
-			await this.makeRequest(
-				{
-					messages: [{ role: "user", content: "Hello" }],
-					max_tokens: 1,
-				},
-				{
-					provider,
-					skipCostCheck: true,
-					enableFallback: false,
-				},
-			);
+			// Get provider configuration
+			const providerConfig = this.config.providers[provider];
+			if (!providerConfig) {
+				throw new Error(`Provider ${provider} not configured`);
+			}
+
+			// Check if API key is present and has reasonable format
+			if (!providerConfig.apiKey || providerConfig.apiKey.trim().length === 0) {
+				throw new Error(`API key missing for provider ${provider}`);
+			}
+
+			// Basic API key format validation
+			const apiKey = providerConfig.apiKey.trim();
+			let isValidFormat = false;
+
+			switch (provider) {
+				case "openai":
+					// OpenAI keys typically start with "sk-"
+					isValidFormat = apiKey.startsWith("sk-") && apiKey.length > 10;
+					break;
+				case "anthropic":
+					// Anthropic keys typically start with "sk-ant-"
+					isValidFormat = apiKey.startsWith("sk-ant-") && apiKey.length > 15;
+					break;
+				case "google":
+					// Google API keys are typically 39 characters
+					isValidFormat = apiKey.length >= 30 && !apiKey.includes(" ");
+					break;
+				default:
+					isValidFormat = apiKey.length > 5; // Basic validation
+			}
+
+			if (!isValidFormat) {
+				throw new Error(`Invalid API key format for provider ${provider}`);
+			}
+
+			// Validate model configuration
+			if (!providerConfig.model) {
+				throw new Error(`Model not configured for provider ${provider}`);
+			}
 
 			return {
 				available: true,

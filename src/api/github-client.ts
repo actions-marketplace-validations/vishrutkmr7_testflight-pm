@@ -28,11 +28,10 @@ import type {
 import type { ProcessedFeedbackData } from "../../types/testflight.js";
 import {
 	API_ENDPOINTS,
-	DEFAULT_LABELS,
-	HTTP_CONFIG,
-} from "../config/constants.js";
-import { getConfig } from "../config/environment.js";
-import { getTestFlightClient } from "./testflight-client.js";
+	DEFAULT_LABEL_CONFIG,
+	DEFAULT_HTTP_CONFIG,
+	getConfiguration,
+} from "../config/index.js";
 
 /**
  * GitHub Issues API Client with rate limiting awareness, screenshot attachment, and secure configuration
@@ -40,9 +39,9 @@ import { getTestFlightClient } from "./testflight-client.js";
 export class GitHubClient {
 	private readonly config: GitHubIntegrationConfig;
 	private readonly baseUrl = API_ENDPOINTS.GITHUB;
-	private readonly defaultTimeout = HTTP_CONFIG.DEFAULT_TIMEOUT;
-	private readonly defaultRetries = HTTP_CONFIG.DEFAULT_RETRIES;
-	private readonly defaultRetryDelay = HTTP_CONFIG.DEFAULT_RETRY_DELAY;
+	private readonly defaultTimeout = DEFAULT_HTTP_CONFIG.timeout;
+	private readonly defaultRetries = DEFAULT_HTTP_CONFIG.retries;
+	private readonly defaultRetryDelay = DEFAULT_HTTP_CONFIG.retryDelay;
 
 	private labelsCache: Map<string, GitHubLabel> = new Map();
 	private milestonesCache: Map<string, GitHubMilestone> = new Map();
@@ -50,11 +49,11 @@ export class GitHubClient {
 	private lastCacheUpdate: { labels?: Date; milestones?: Date } = {};
 
 	constructor() {
-		const envConfig = getConfig();
+		const envConfig = getConfiguration();
 
 		if (!envConfig.github) {
 			throw new Error(
-				"GitHub configuration not found. Please set GITHUB_TOKEN, GITHUB_OWNER, and GITHUB_REPO.",
+				"GitHub configuration not found. Please set GTHB_TOKEN, GITHUB_OWNER, and GITHUB_REPO.",
 			);
 		}
 
@@ -62,9 +61,9 @@ export class GitHubClient {
 			token: envConfig.github.token,
 			owner: envConfig.github.owner,
 			repo: envConfig.github.repo,
-			defaultLabels: [...DEFAULT_LABELS.BASE],
-			crashLabels: [...DEFAULT_LABELS.CRASH],
-			feedbackLabels: [...DEFAULT_LABELS.FEEDBACK],
+			defaultLabels: [...DEFAULT_LABEL_CONFIG.defaultLabels],
+			crashLabels: [...DEFAULT_LABEL_CONFIG.crashLabels],
+			feedbackLabels: [...DEFAULT_LABEL_CONFIG.feedbackLabels],
 			enableDuplicateDetection: true,
 			duplicateDetectionDays: 7,
 			enableScreenshotUpload: true,
@@ -112,15 +111,15 @@ export class GitHubClient {
 			// Handle screenshot attachments if enabled
 			let attachmentResults:
 				| {
-						uploaded: number;
-						failed: number;
-						details: Array<{
-							filename: string;
-							success: boolean;
-							error?: string;
-							url?: string;
-						}>;
-				  }
+					uploaded: number;
+					failed: number;
+					details: Array<{
+						filename: string;
+						success: boolean;
+						error?: string;
+						url?: string;
+					}>;
+				}
 				| undefined;
 			if (
 				options.attachScreenshots !== false &&
@@ -917,50 +916,12 @@ export class GitHubClient {
 			this.config.enableScreenshotUpload &&
 			feedback.screenshotData.images.length > 0
 		) {
-			const testFlightClient = getTestFlightClient();
-
 			try {
-				const screenshots = await testFlightClient.downloadScreenshots({
-					id: feedback.id,
-					type: "betaFeedbackScreenshotSubmissions",
-					attributes: {
-						submittedAt: feedback.submittedAt.toISOString(),
-						appVersion: feedback.appVersion,
-						buildNumber: feedback.buildNumber,
-						deviceFamily: feedback.deviceInfo.family,
-						deviceModel: feedback.deviceInfo.model,
-						osVersion: feedback.deviceInfo.osVersion,
-						locale: feedback.deviceInfo.locale,
-						bundleId: feedback.bundleId,
-						feedbackText: feedback.screenshotData.text || "",
-						screenshots: feedback.screenshotData.images.map((img, _index) => ({
-							url: img.url,
-							fileName: img.fileName,
-							fileSize: img.fileSize,
-							expiresAt: img.expiresAt.toISOString(),
-						})),
-						annotations: feedback.screenshotData.annotations || [],
-					},
-					relationships: {},
-				});
-
-				screenshots.forEach((screenshot, index) => {
-					const imageInfo = feedback.screenshotData?.images?.[index];
-					if (imageInfo) {
-						attachments.push({
-							filename: imageInfo.fileName,
-							content: screenshot,
-							contentType: "image/png",
-							size: screenshot.length,
-						});
-					}
-				});
+				const screenshots = await this.downloadScreenshotsForFeedback(feedback);
+				attachments.push(...screenshots);
 			} catch (error) {
-				const errorMessage =
-					error instanceof Error ? error.message : String(error);
-				console.warn(
-					`Failed to download screenshots for issue: ${errorMessage}`,
-				);
+				const errorMessage = error instanceof Error ? error.message : String(error);
+				console.warn(`Failed to download screenshots for issue: ${errorMessage}`);
 			}
 		}
 
@@ -1020,6 +981,44 @@ export class GitHubClient {
 				body += `**Message:**\n\`\`\`\n${feedback.crashData.exceptionMessage}\n\`\`\`\n\n`;
 			}
 
+			// ENHANCEMENT: Add system context for better debugging
+			if (feedback.crashData.systemInfo) {
+				body += "### 📊 System Context at Crash\n\n";
+				const sysInfo = feedback.crashData.systemInfo;
+
+				body += "| Context | Value |\n";
+				body += "|---------|-------|\n";
+
+				if (sysInfo.batteryPercentage !== undefined) {
+					const batteryIcon = sysInfo.batteryPercentage < 20 ? "🪫" : sysInfo.batteryPercentage < 50 ? "🔋" : "🔋";
+					body += `| ${batteryIcon} **Battery** | ${sysInfo.batteryPercentage}% |\n`;
+				}
+
+				if (sysInfo.appUptimeFormatted) {
+					body += `| ⏱️ **App Uptime** | ${sysInfo.appUptimeFormatted} |\n`;
+				}
+
+				if (sysInfo.connectionType) {
+					const connectionIcon = sysInfo.connectionType.toLowerCase().includes('wifi') ? "📶" : "📱";
+					body += `| ${connectionIcon} **Connection** | ${sysInfo.connectionType} |\n`;
+				}
+
+				if (sysInfo.diskSpaceRemainingGB !== null && sysInfo.diskSpaceRemainingGB !== undefined) {
+					const spaceIcon = sysInfo.diskSpaceRemainingGB < 1 ? "💾" : "💿";
+					body += `| ${spaceIcon} **Free Space** | ${sysInfo.diskSpaceRemainingGB}GB |\n`;
+				}
+
+				if (sysInfo.architecture) {
+					body += `| 🏗️ **Architecture** | ${sysInfo.architecture} |\n`;
+				}
+
+				if (sysInfo.pairedAppleWatch) {
+					body += `| ⌚ **Apple Watch** | ${sysInfo.pairedAppleWatch} |\n`;
+				}
+
+				body += "\n";
+			}
+
 			body += `### Stack Trace\n\`\`\`\n${feedback.crashData.trace}\n\`\`\`\n\n`;
 
 			if (feedback.crashData.logs.length > 0) {
@@ -1036,6 +1035,54 @@ export class GitHubClient {
 
 			if (feedback.screenshotData.text) {
 				body += `**Feedback Text:**\n> ${feedback.screenshotData.text.replace(/\n/g, "\n> ")}\n\n`;
+			}
+
+			// ENHANCEMENT: Add system context for screenshot feedback
+			if (feedback.screenshotData.systemInfo) {
+				body += "### 📊 System Context at Feedback\n\n";
+				const sysInfo = feedback.screenshotData.systemInfo;
+
+				body += "| Context | Value |\n";
+				body += "|---------|-------|\n";
+
+				if (sysInfo.applicationState) {
+					const stateIcon = sysInfo.applicationState === "foreground" ? "🟢" :
+						sysInfo.applicationState === "background" ? "🟡" : "🔴";
+					body += `| ${stateIcon} **App State** | ${sysInfo.applicationState} |\n`;
+				}
+
+				if (sysInfo.batteryLevel !== undefined) {
+					const batteryIcon = sysInfo.batteryLevel < 20 ? "🪫" : sysInfo.batteryLevel < 50 ? "🔋" : "🔋";
+					body += `| ${batteryIcon} **Battery** | ${sysInfo.batteryLevel}% |\n`;
+				}
+
+				if (sysInfo.memoryPressure) {
+					const memoryIcon = sysInfo.memoryPressure === "critical" ? "🚨" :
+						sysInfo.memoryPressure === "warning" ? "⚠️" : "✅";
+					body += `| ${memoryIcon} **Memory** | ${sysInfo.memoryPressure} |\n`;
+				}
+
+				if (sysInfo.thermalState) {
+					const thermalIcon = sysInfo.thermalState === "critical" ? "🔥" :
+						sysInfo.thermalState === "serious" ? "🌡️" : "❄️";
+					body += `| ${thermalIcon} **Thermal** | ${sysInfo.thermalState} |\n`;
+				}
+
+				if (sysInfo.diskSpaceRemaining !== undefined) {
+					const spaceGB = Math.round((sysInfo.diskSpaceRemaining / (1024 ** 3)) * 10) / 10;
+					const spaceIcon = spaceGB < 1 ? "💾" : "💿";
+					body += `| ${spaceIcon} **Free Space** | ${spaceGB}GB |\n`;
+				}
+
+				body += "\n";
+			}
+
+			if (feedback.screenshotData.submissionMethod) {
+				body += `**Submission Method:** ${feedback.screenshotData.submissionMethod}\n\n`;
+			}
+
+			if (feedback.screenshotData.testerNotes) {
+				body += `**Tester Notes:**\n> ${feedback.screenshotData.testerNotes.replace(/\n/g, "\n> ")}\n\n`;
 			}
 
 			if (feedback.screenshotData.images.length > 0) {
@@ -1146,6 +1193,127 @@ export class GitHubClient {
 	}
 
 	/**
+	 * Downloads screenshots for TestFlight feedback using enhanced methods (DRY)
+	 */
+	private async downloadScreenshotsForFeedback(
+		feedback: ProcessedFeedbackData,
+	): Promise<GitHubScreenshotUpload[]> {
+		if (!feedback.screenshotData?.images) {
+			return [];
+		}
+
+		const attachments: GitHubScreenshotUpload[] = [];
+
+		// Use enhanced screenshots if available, fallback to regular images
+		if (feedback.screenshotData.enhancedImages) {
+			// Process enhanced screenshots with metadata
+			for (const enhancedImage of feedback.screenshotData.enhancedImages) {
+				try {
+					const imageData = await this.downloadSingleScreenshotImageData(enhancedImage);
+					if (imageData) {
+						attachments.push({
+							filename: enhancedImage.fileName,
+							content: imageData,
+							contentType: this.getContentTypeFromFormat(enhancedImage.imageFormat || 'png'),
+							size: imageData.length,
+						});
+					}
+				} catch (error) {
+					console.warn(`Failed to download enhanced screenshot ${enhancedImage.fileName}:`, error);
+				}
+			}
+		} else {
+			// Fallback to regular screenshot processing
+			for (const imageInfo of feedback.screenshotData.images) {
+				try {
+					const imageData = await this.downloadSingleScreenshotImageData({
+						url: imageInfo.url,
+						fileName: imageInfo.fileName,
+						fileSize: imageInfo.fileSize,
+						expiresAt: imageInfo.expiresAt,
+					});
+
+					if (imageData) {
+						attachments.push({
+							filename: imageInfo.fileName,
+							content: imageData,
+							contentType: this.getContentTypeFromFileName(imageInfo.fileName),
+							size: imageData.length,
+						});
+					}
+				} catch (error) {
+					console.warn(`Failed to download screenshot ${imageInfo.fileName}:`, error);
+				}
+			}
+		}
+
+		return attachments;
+	}
+
+	/**
+	 * Downloads a single screenshot image data (helper for DRY code)
+	 */
+	private async downloadSingleScreenshotImageData(
+		imageInfo: { url: string; fileName: string; fileSize: number; expiresAt: Date },
+	): Promise<Uint8Array | null> {
+		// Check if URL hasn't expired
+		if (imageInfo.expiresAt <= new Date()) {
+			console.warn(`Screenshot URL expired: ${imageInfo.url}`);
+			return null;
+		}
+
+		const response = await fetch(imageInfo.url, {
+			headers: {
+				"User-Agent": "TestFlight-PM/1.0",
+			},
+			signal: AbortSignal.timeout(DEFAULT_HTTP_CONFIG.timeout),
+		});
+
+		if (!response.ok) {
+			console.warn(
+				`Failed to download screenshot: ${response.status} ${response.statusText}`,
+			);
+			return null;
+		}
+
+		return new Uint8Array(await response.arrayBuffer());
+	}
+
+	/**
+	 * Gets MIME content type from image format
+	 */
+	private getContentTypeFromFormat(format: "png" | "jpeg" | "heic"): string {
+		switch (format) {
+			case 'png':
+				return 'image/png';
+			case 'jpeg':
+				return 'image/jpeg';
+			case 'heic':
+				return 'image/heic';
+			default:
+				return 'image/png';
+		}
+	}
+
+	/**
+	 * Gets MIME content type from filename
+	 */
+	private getContentTypeFromFileName(fileName: string): string {
+		const extension = fileName.toLowerCase().split('.').pop();
+		switch (extension) {
+			case 'png':
+				return 'image/png';
+			case 'jpg':
+			case 'jpeg':
+				return 'image/jpeg';
+			case 'heic':
+				return 'image/heic';
+			default:
+				return 'image/png';
+		}
+	}
+
+	/**
 	 * Utility function for sleeping/waiting
 	 */
 	private sleep(ms: number): Promise<void> {
@@ -1178,7 +1346,7 @@ export function clearGitHubClientInstance(): void {
  */
 export function validateGitHubConfig(): boolean {
 	try {
-		const config = getConfig();
+		const config = getConfiguration();
 		return !!(
 			config.github?.token &&
 			config.github?.owner &&

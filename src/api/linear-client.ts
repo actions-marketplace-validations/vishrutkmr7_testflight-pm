@@ -17,11 +17,11 @@ import type {
 } from "../../types/linear.js";
 import type { ProcessedFeedbackData } from "../../types/testflight.js";
 import {
-	DEFAULT_LABELS,
+	DEFAULT_LABEL_CONFIG,
 	ERROR_MESSAGES,
 	PRIORITY_LEVELS,
-} from "../config/constants.js";
-import { getConfig } from "../config/environment.js";
+	getConfiguration,
+} from "../config/index.js";
 
 /**
  * Linear API Client with official SDK integration, rate limiting awareness, and secure configuration
@@ -32,7 +32,7 @@ export class LinearClient {
 	private teamCache: LinearTeam | null = null;
 
 	constructor() {
-		const envConfig = getConfig();
+		const envConfig = getConfiguration();
 
 		if (!envConfig.linear) {
 			throw new Error(ERROR_MESSAGES.LINEAR_CONFIG_MISSING);
@@ -42,9 +42,9 @@ export class LinearClient {
 			apiToken: envConfig.linear.apiToken,
 			teamId: envConfig.linear.teamId,
 			defaultPriority: PRIORITY_LEVELS.NORMAL,
-			defaultLabels: [...DEFAULT_LABELS.BASE],
-			crashLabels: [...DEFAULT_LABELS.CRASH],
-			feedbackLabels: [...DEFAULT_LABELS.FEEDBACK],
+			defaultLabels: [...DEFAULT_LABEL_CONFIG.defaultLabels],
+			crashLabels: [...DEFAULT_LABEL_CONFIG.crashLabels],
+			feedbackLabels: [...DEFAULT_LABEL_CONFIG.feedbackLabels],
 			enableDuplicateDetection: true,
 			duplicateDetectionDays: 7,
 		};
@@ -63,6 +63,11 @@ export class LinearClient {
 		additionalLabels: string[] = [],
 		assigneeId?: string,
 		projectId?: string,
+		options?: {
+			customTitle?: string;
+			customDescription?: string;
+			priority?: LinearPriority;
+		},
 	): Promise<LinearIssue> {
 		try {
 			// Check for duplicates if enabled
@@ -82,6 +87,7 @@ export class LinearClient {
 				additionalLabels,
 				assigneeId,
 				projectId,
+				options,
 			);
 
 			// Create issue using Linear SDK
@@ -176,43 +182,43 @@ export class LinearClient {
 			const issueForComment: LinearIssue = issueBasic
 				? await this.convertToLinearIssue(issueBasic)
 				: {
+					id: "unknown",
+					identifier: "unknown",
+					title: "Unknown Issue",
+					description: "",
+					url: "",
+					priority: 3,
+					state: {
 						id: "unknown",
-						identifier: "unknown",
-						title: "Unknown Issue",
+						name: "Unknown",
 						description: "",
-						url: "",
-						priority: 3,
-						state: {
-							id: "unknown",
-							name: "Unknown",
-							description: "",
-							color: "#000000",
-							position: 0,
-							type: "backlog",
-							createdAt: new Date().toISOString(),
-							updatedAt: new Date().toISOString(),
-							team,
-						},
-						assignee: undefined,
-						team,
-						labels: [],
+						color: "#000000",
+						position: 0,
+						type: "backlog",
 						createdAt: new Date().toISOString(),
 						updatedAt: new Date().toISOString(),
-						estimate: 0,
-						sortOrder: 0,
-						number: 0,
-						creator: await this.createFallbackUser(),
-						parent: undefined,
-						children: [],
-						relations: [],
-						comments: [],
-						attachments: [],
-						project: undefined,
-						cycle: undefined,
-						previousIdentifiers: [],
-						customerTicketCount: 0,
-						subscribers: [],
-					};
+						team,
+					},
+					assignee: undefined,
+					team,
+					labels: [],
+					createdAt: new Date().toISOString(),
+					updatedAt: new Date().toISOString(),
+					estimate: 0,
+					sortOrder: 0,
+					number: 0,
+					creator: await this.createFallbackUser(),
+					parent: undefined,
+					children: [],
+					relations: [],
+					comments: [],
+					attachments: [],
+					project: undefined,
+					cycle: undefined,
+					previousIdentifiers: [],
+					customerTicketCount: 0,
+					subscribers: [],
+				};
 
 			return {
 				id: comment.id,
@@ -278,6 +284,26 @@ export class LinearClient {
 			return this.teamCache;
 		} catch (error) {
 			throw new Error(`Failed to get Linear team: ${error}`);
+		}
+	}
+
+	/**
+	 * Gets the configured team ID for health checking
+	 */
+	public getConfiguredTeamId(): string {
+		return this.config.teamId;
+	}
+
+	/**
+	 * Tests basic Linear connectivity without full team validation
+	 * Used by health checkers for lightweight connectivity testing
+	 */
+	public async testConnectivity(): Promise<boolean> {
+		try {
+			await this.getCurrentUser();
+			return true;
+		} catch {
+			return false;
 		}
 	}
 
@@ -656,22 +682,72 @@ export class LinearClient {
 		additionalLabels: string[] = [],
 		assigneeId?: string,
 		projectId?: string,
+		options?: {
+			customTitle?: string;
+			customDescription?: string;
+			priority?: LinearPriority;
+		},
 	) {
 		const isCrash = feedback.type === "crash";
 		const typeIcon = isCrash ? "💥" : "📱";
 		const typeLabel = isCrash ? "Crash Report" : "User Feedback";
 
-		// Generate title
-		let title = `${typeIcon} ${typeLabel}: ${feedback.appVersion} (${feedback.buildNumber})`;
+		// Generate title - use enhanced title if provided, otherwise generate standard title
+		let title = options?.customTitle ||
+			`${typeIcon} ${typeLabel}: ${feedback.appVersion} (${feedback.buildNumber})`;
 
-		if (isCrash && feedback.crashData?.exceptionType) {
-			title += ` - ${feedback.crashData.exceptionType}`;
-		} else if (feedback.screenshotData?.text) {
-			const shortText = feedback.screenshotData.text.substring(0, 40);
-			title += ` - ${shortText}${shortText.length < feedback.screenshotData.text.length ? "..." : ""}`;
+		// If using standard title, add additional context
+		if (!options?.customTitle) {
+			if (isCrash && feedback.crashData?.exceptionType) {
+				title += ` - ${feedback.crashData.exceptionType}`;
+			} else if (feedback.screenshotData?.text) {
+				const shortText = feedback.screenshotData.text.substring(0, 40);
+				title += ` - ${shortText}${shortText.length < feedback.screenshotData.text.length ? "..." : ""}`;
+			}
 		}
 
-		// Generate description
+		// Generate description - use enhanced description if provided, otherwise generate standard description
+		const description = options?.customDescription ||
+			this.generateStandardDescription(feedback, typeIcon, typeLabel);
+
+		// Determine labels
+		const baseLabels = isCrash
+			? this.config.crashLabels
+			: this.config.feedbackLabels;
+		const allLabels = [
+			...this.config.defaultLabels,
+			...baseLabels,
+			...additionalLabels,
+		];
+
+		// Determine priority - use enhanced priority if provided, otherwise use default logic
+		let priority = options?.priority || this.config.defaultPriority;
+		if (!options?.priority && isCrash) {
+			priority = 2; // High priority for crashes when not using enhanced priority
+		}
+
+		return {
+			title,
+			description,
+			teamId: this.config.teamId,
+			priority,
+			assigneeId,
+			projectId,
+			labels: allLabels,
+		};
+	}
+
+	/**
+	 * Generates standard description for Linear issues from TestFlight feedback
+	 */
+	private generateStandardDescription(
+		feedback: ProcessedFeedbackData,
+		typeIcon: string,
+		typeLabel: string,
+	): string {
+		const isCrash = feedback.type === "crash";
+
+		// Start with header
 		let description = `## ${typeIcon} ${typeLabel} from TestFlight\n\n`;
 
 		// Metadata table
@@ -696,6 +772,44 @@ export class LinearClient {
 				description += `**Message:**\n\`\`\`\n${feedback.crashData.exceptionMessage}\n\`\`\`\n\n`;
 			}
 
+			// ENHANCEMENT: Add system context for better debugging
+			if (feedback.crashData.systemInfo) {
+				description += "### 📊 System Context at Crash\n\n";
+				const sysInfo = feedback.crashData.systemInfo;
+
+				description += "| Context | Value |\n";
+				description += "|---------|-------|\n";
+
+				if (sysInfo.batteryPercentage !== undefined) {
+					const batteryIcon = sysInfo.batteryPercentage < 20 ? "🪫" : sysInfo.batteryPercentage < 50 ? "🔋" : "🔋";
+					description += `| ${batteryIcon} **Battery** | ${sysInfo.batteryPercentage}% |\n`;
+				}
+
+				if (sysInfo.appUptimeFormatted) {
+					description += `| ⏱️ **App Uptime** | ${sysInfo.appUptimeFormatted} |\n`;
+				}
+
+				if (sysInfo.connectionType) {
+					const connectionIcon = sysInfo.connectionType.toLowerCase().includes('wifi') ? "📶" : "📱";
+					description += `| ${connectionIcon} **Connection** | ${sysInfo.connectionType} |\n`;
+				}
+
+				if (sysInfo.diskSpaceRemainingGB !== null && sysInfo.diskSpaceRemainingGB !== undefined) {
+					const spaceIcon = sysInfo.diskSpaceRemainingGB < 1 ? "💾" : "💿";
+					description += `| ${spaceIcon} **Free Space** | ${sysInfo.diskSpaceRemainingGB}GB |\n`;
+				}
+
+				if (sysInfo.architecture) {
+					description += `| 🏗️ **Architecture** | ${sysInfo.architecture} |\n`;
+				}
+
+				if (sysInfo.pairedAppleWatch) {
+					description += `| ⌚ **Apple Watch** | ${sysInfo.pairedAppleWatch} |\n`;
+				}
+
+				description += "\n";
+			}
+
 			description += `### Stack Trace\n\`\`\`\n${feedback.crashData.trace}\n\`\`\`\n\n`;
 
 			if (feedback.crashData.logs.length > 0) {
@@ -714,8 +828,21 @@ export class LinearClient {
 				description += `**Feedback Text:**\n> ${feedback.screenshotData.text.replace(/\n/g, "\n> ")}\n\n`;
 			}
 
+			// Show enhanced tester notes if available
+			if (feedback.screenshotData.testerNotes) {
+				description += `**Tester Notes:**\n> ${feedback.screenshotData.testerNotes.replace(/\n/g, "\n> ")}\n\n`;
+			}
+
 			if (feedback.screenshotData.images.length > 0) {
-				description += `**Screenshots:** ${feedback.screenshotData.images.length} attached\n\n`;
+				description += `**Screenshots:** ${feedback.screenshotData.images.length} attached`;
+
+				// Add enhanced screenshot info if available
+				if (feedback.screenshotData.enhancedImages && feedback.screenshotData.enhancedImages.length > 0) {
+					const enhancedCount = feedback.screenshotData.enhancedImages.length;
+					description += ` (${enhancedCount} with enhanced metadata)`;
+				}
+
+				description += "\n\n";
 			}
 
 			if (
@@ -723,6 +850,15 @@ export class LinearClient {
 				feedback.screenshotData.annotations.length > 0
 			) {
 				description += `**Annotations:** ${feedback.screenshotData.annotations.length} user annotation(s)\n\n`;
+			}
+
+			// Add submission method and system info if available
+			if (feedback.screenshotData.submissionMethod) {
+				description += `**Submission Method:** ${feedback.screenshotData.submissionMethod}\n\n`;
+			}
+
+			if (feedback.screenshotData.systemInfo) {
+				description += this.formatSystemInfo(feedback.screenshotData.systemInfo);
 			}
 		}
 
@@ -740,31 +876,7 @@ export class LinearClient {
 
 		description += `---\n*Automatically created from TestFlight feedback. ID: \`${feedback.id}\`*`;
 
-		// Determine labels
-		const baseLabels = isCrash
-			? this.config.crashLabels
-			: this.config.feedbackLabels;
-		const allLabels = [
-			...this.config.defaultLabels,
-			...baseLabels,
-			...additionalLabels,
-		];
-
-		// Determine priority based on feedback type
-		let priority = this.config.defaultPriority;
-		if (isCrash) {
-			priority = 2; // High priority for crashes
-		}
-
-		return {
-			title,
-			description,
-			teamId: this.config.teamId,
-			priority,
-			assigneeId,
-			projectId,
-			labels: allLabels,
-		};
+		return description;
 	}
 
 	/**
@@ -851,6 +963,44 @@ export class LinearClient {
 				return "backlog";
 		}
 	}
+
+	/**
+	 * Formats enhanced system information for display (DRY helper)
+	 */
+	private formatSystemInfo(systemInfo: any): string {
+		if (!systemInfo) {
+			return "";
+		}
+
+		let info = "**System Information:**\n";
+
+		if (systemInfo.applicationState) {
+			info += `- Application State: ${systemInfo.applicationState}\n`;
+		}
+
+		if (systemInfo.memoryPressure) {
+			info += `- Memory Pressure: ${systemInfo.memoryPressure}\n`;
+		}
+
+		if (systemInfo.batteryLevel !== undefined) {
+			info += `- Battery Level: ${(systemInfo.batteryLevel * 100).toFixed(0)}%\n`;
+		}
+
+		if (systemInfo.batteryState) {
+			info += `- Battery State: ${systemInfo.batteryState}\n`;
+		}
+
+		if (systemInfo.thermalState) {
+			info += `- Thermal State: ${systemInfo.thermalState}\n`;
+		}
+
+		if (systemInfo.diskSpaceRemaining !== undefined) {
+			const diskSpaceGB = (systemInfo.diskSpaceRemaining / (1024 * 1024 * 1024)).toFixed(1);
+			info += `- Available Storage: ${diskSpaceGB} GB\n`;
+		}
+
+		return info + "\n";
+	}
 }
 
 // Global Linear client instance
@@ -875,7 +1025,7 @@ export function clearLinearClientInstance(): void {
  */
 export function validateLinearConfig(): boolean {
 	try {
-		const config = getConfig();
+		const config = getConfiguration();
 		return !!(config.linear?.apiToken && config.linear?.teamId);
 	} catch {
 		return false;
